@@ -28,6 +28,14 @@
     "plugins": [
       "expo-router",
       [
+        "expo-media-library",
+        {
+          "granularPermissions": [
+            "video"
+          ]
+        }
+      ],
+      [
         "expo-splash-screen",
         {
           "image": "./assets/images/splash-icon.png",

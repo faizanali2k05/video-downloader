@@ -1,13 +1,14 @@
 import { Video } from 'expo-av';
-import * as FileSystem from 'expo-file-system';
+import { isRunningInExpoGo } from 'expo';
+import * as FileSystem from 'expo-file-system/legacy';
 import * as MediaLibrary from 'expo-media-library';
 import * as Clipboard from 'expo-clipboard';
-import AsyncStorage from '@react-native-async-storage/async-storage';
-import { useEffect, useMemo, useRef, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import {
   Alert,
   Button,
   FlatList,
+  Platform,
   StyleSheet,
   Text,
   TextInput,
@@ -29,7 +30,7 @@ type DownloadItem = {
   error?: string;
 };
 
-const STORAGE_KEY = '@video_downloader_downloads';
+const DOWNLOADS_FILE_URI = `${FileSystem.documentDirectory}downloads.json`;
 
 const isValidUrl = (value: string) => /^https?:\/\//i.test(value);
 const isYoutubeUrl = (value: string) => /(?:youtube\.com|youtu\.be)\//i.test(value);
@@ -52,6 +53,7 @@ const resolveYoutubeStream = async (videoUrl: string): Promise<string> => {
 };
 
 export default function HomeScreen() {
+  const runningInExpoGo = isRunningInExpoGo();
   const deviceScheme = useColorScheme();
   const [themeOverride, setThemeOverride] = useState<'light' | 'dark' | null>(null);
   const colorScheme = themeOverride ?? deviceScheme ?? 'light';
@@ -65,27 +67,81 @@ export default function HomeScreen() {
 
   useEffect(() => {
     const init = async () => {
-      const { status } = await MediaLibrary.requestPermissionsAsync();
-      setMediaPermission(status === 'granted' ? 'granted' : 'denied');
+      if (runningInExpoGo) {
+        setMediaPermission('denied');
+      } else {
+        try {
+          const { status } = await MediaLibrary.requestPermissionsAsync(false, ['video']);
+          setMediaPermission(status === 'granted' ? 'granted' : 'denied');
+        } catch (error) {
+          console.log('Media permission request failed', error);
+          setMediaPermission('denied');
+        }
+      }
 
-      const saved = await AsyncStorage.getItem(STORAGE_KEY);
-      if (saved) {
+      try {
+        const saved = await FileSystem.readAsStringAsync(DOWNLOADS_FILE_URI);
         try {
           setDownloads(JSON.parse(saved));
         } catch (error) {
           console.log('Failed to parse saved downloads', error);
         }
+      } catch (error: any) {
+        if (error?.code !== 'ERR_FILESYSTEM_NO_SUCH_FILE') {
+          console.log('Failed to read saved downloads', error);
+        }
       }
     };
 
     init();
-  }, []);
+  }, [runningInExpoGo]);
 
   useEffect(() => {
-    AsyncStorage.setItem(STORAGE_KEY, JSON.stringify(downloads)).catch((error) => {
+    FileSystem.writeAsStringAsync(DOWNLOADS_FILE_URI, JSON.stringify(downloads)).catch((error) => {
       console.log('Failed to persist downloads', error);
     });
   }, [downloads]);
+
+  const ensureMediaPermission = async () => {
+    if (runningInExpoGo) {
+      setMediaPermission('denied');
+      Alert.alert(
+        'Expo Go limitation',
+        'Expo Go on Android cannot provide full media-library access for saving videos. Create a development build to save downloads to your phone gallery.'
+      );
+      return false;
+    }
+
+    try {
+      const currentPermission = await MediaLibrary.getPermissionsAsync(false, ['video']);
+      if (currentPermission.status === 'granted') {
+        setMediaPermission('granted');
+        return true;
+      }
+
+      const requestedPermission = await MediaLibrary.requestPermissionsAsync(false, ['video']);
+      const granted = requestedPermission.status === 'granted';
+      setMediaPermission(granted ? 'granted' : 'denied');
+
+      if (!granted) {
+        const message =
+          Platform.OS === 'android'
+            ? 'Gallery access was not granted. In Expo Go, media-library saving may be limited. A development build is recommended for saving videos to your phone gallery.'
+            : 'Gallery access was not granted.';
+        Alert.alert('Permission required', message);
+      }
+
+      return granted;
+    } catch (error) {
+      console.log('Media permission check failed', error);
+      setMediaPermission('denied');
+      Alert.alert(
+        'Cannot access gallery',
+        'Saving to the phone gallery is unavailable right now. On Android, use a development build instead of Expo Go for full media-library access.'
+      );
+      return false;
+    }
+  };
 
   const setTheme = (value: 'light' | 'dark' | null) => setThemeOverride(value);
 
@@ -102,6 +158,11 @@ export default function HomeScreen() {
 
   const saveToGallery = async (fileUri: string, id: string) => {
     try {
+      const hasPermission = await ensureMediaPermission();
+      if (!hasPermission) {
+        return;
+      }
+
       const asset = await MediaLibrary.createAssetAsync(fileUri);
       const album = await MediaLibrary.getAlbumAsync('VideoDownloader');
 
@@ -122,8 +183,13 @@ export default function HomeScreen() {
             : item
         )
       );
+      Alert.alert('Saved', 'Video was saved to your phone gallery.');
     } catch (error) {
       console.log('Save to gallery failed:', error);
+      Alert.alert(
+        'Save failed',
+        (error as Error).message || 'The video downloaded, but it could not be saved to the phone gallery.'
+      );
     }
   };
 
@@ -224,9 +290,7 @@ export default function HomeScreen() {
         )
       );
 
-      if (mediaPermission === 'granted') {
-        await saveToGallery(uri, id);
-      }
+      await saveToGallery(uri, id);
 
       setUrl('');
     } catch (error: any) {
@@ -284,9 +348,7 @@ export default function HomeScreen() {
         )
       );
 
-      if (mediaPermission === 'granted') {
-        await saveToGallery(uri, id);
-      }
+      await saveToGallery(uri, id);
     } catch (error: any) {
       console.log('Resume error', error);
       setDownloads((prev) =>
@@ -390,7 +452,7 @@ export default function HomeScreen() {
               </Text>
             </TouchableOpacity>
             <Text style={styled.itemSub}>
-              {Item status: {item.status.toUpperCase()} {item.savedToGallery ? '(saved)' : ''}
+              Item status: {item.status.toUpperCase()} {item.savedToGallery ? '(saved)' : ''}
             </Text>
             <View style={styles.progressTrack}>
               <View style={[styles.progressFill, { width: `${Math.round(item.progress * 100)}%` }]} />
@@ -399,6 +461,9 @@ export default function HomeScreen() {
             <View style={styles.actionsRow}>
               {item.status === 'downloading' && <Button title="Pause" onPress={() => pauseDownload(item.id)} />}
               {item.status === 'paused' && <Button title="Resume" onPress={() => resumeDownload(item.id)} />}
+              {item.status === 'completed' && !item.savedToGallery && (
+                <Button title="Save" onPress={() => saveToGallery(item.fileUri, item.id)} />
+              )}
               {(item.status === 'failed' || item.status === 'completed') && (
                 <Button title="Delete" color="red" onPress={() => deleteDownload(item)} />
               )}
